@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Bu dosyayı app/src/main/res/xml/file_paths.xml olarak kaydedin -->
+<paths>
+    <cache-path name="exports" path="exports/" />
+</paths>
