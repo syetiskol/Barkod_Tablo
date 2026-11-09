@@ -9,6 +9,8 @@ import android.media.AudioManager
 import android.media.ToneGenerator
 import android.os.Bundle
 import android.os.Environment
+import android.os.VibrationEffect
+import android.os.Vibrator
 import android.provider.MediaStore
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -45,6 +47,7 @@ import androidx.core.content.FileProvider
 import androidx.lifecycle.LifecycleOwner
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.common.InputImage
+import kotlinx.coroutines.delay
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.util.concurrent.Executors
@@ -117,16 +120,40 @@ fun SheetScreen(headers: List<String>, onBack: () -> Unit) {
     var scanning by remember { mutableStateOf(false) }
     var showSave by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
-    val tone = remember { ToneGenerator(AudioManager.STREAM_MUSIC, 80) }
+    val tone = remember { ToneGenerator(AudioManager.STREAM_MUSIC, 100) }
+    DisposableEffect(Unit) { onDispose { tone.release() } }
+    val vibrator = remember { ctx.getSystemService(Vibrator::class.java) }
+    var message by remember { mutableStateOf<Pair<String, Boolean>?>(null) } // (metin, hata mı)
+    var messageId by remember { mutableIntStateOf(0) }
 
-    fun addCode(code: String) {
+    fun addCode(raw: String) {
+        val code = raw.trim()
+        if (code.isEmpty()) return
+        // Aynı barkod bu kolonda zaten varsa ekleme, uyar
+        if (rows.any { it[target].trim() == code }) {
+            tone.startTone(ToneGenerator.TONE_SUP_ERROR, 300)
+            vibrator?.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 120, 80, 120), -1))
+            message = "Bu barkod zaten eklendi: $code" to true
+            messageId++
+            return
+        }
         val idx = rows.indexOfFirst { it[target].isBlank() }
         if (idx >= 0) {
             rows[idx] = rows[idx].toMutableList().also { it[target] = code }
         } else {
             rows.add(List(headers.size) { if (it == target) code else "" })
         }
-        tone.startTone(ToneGenerator.TONE_PROP_BEEP, 120)
+        tone.startTone(ToneGenerator.TONE_PROP_BEEP, 200)
+        vibrator?.vibrate(VibrationEffect.createOneShot(80, VibrationEffect.DEFAULT_AMPLITUDE))
+        message = "Eklendi: $code" to false
+        messageId++
+    }
+
+    LaunchedEffect(messageId) {
+        if (message != null) {
+            delay(2000)
+            message = null
+        }
     }
 
     LaunchedEffect(rows.size) { if (rows.isNotEmpty()) listState.animateScrollToItem(rows.size - 1) }
@@ -173,6 +200,18 @@ fun SheetScreen(headers: List<String>, onBack: () -> Unit) {
             }
         }
 
+        // Durum mesajı
+        message?.let { (text, isErr) ->
+            Text(
+                text,
+                color = Color.White,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.fillMaxWidth()
+                    .background(if (isErr) Color(0xFFC62828) else Color(0xFF2E7D32))
+                    .padding(10.dp)
+            )
+        }
+
         // Kamera
         if (scanning) {
             ScannerView(onCode = ::addCode, modifier = Modifier.fillMaxWidth().height(220.dp))
@@ -206,6 +245,7 @@ fun ScannerView(onCode: (String) -> Unit, modifier: Modifier) {
     val executor = remember { Executors.newSingleThreadExecutor() }
     val scanner = remember { BarcodeScanning.getClient() }
     var last by remember { mutableStateOf("" to 0L) }
+    val latestOnCode by rememberUpdatedState(onCode)
 
     DisposableEffect(Unit) {
         onDispose {
@@ -234,10 +274,11 @@ fun ScannerView(onCode: (String) -> Unit, modifier: Modifier) {
                     .addOnSuccessListener { list ->
                         val v = list.firstOrNull()?.rawValue
                         val now = System.currentTimeMillis()
-                        // Aynı barkodu 2 sn içinde tekrar ekleme
-                        if (v != null && !(v == last.first && now - last.second < 2000)) {
+                        if (v != null) {
+                            // Kamera aynı barkodun üzerindeyken tekrar tekrar tetiklenmesin
+                            val same = v == last.first && now - last.second < 1500
                             last = v to now
-                            onCode(v)
+                            if (!same) latestOnCode(v)
                         }
                     }
                     .addOnCompleteListener { proxy.close() }
@@ -346,28 +387,48 @@ private fun colName(i: Int): String {
 
 private fun esc(s: String) = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
+// Sadece rakamlardan oluşan, en fazla 15 haneli ve başında 0 olmayan değerler sayı olarak yazılır
+// (Excel 15 haneden sonrasını doğru tutamaz; başında 0 olanlar metin kalır ki sıfırlar silinmesin)
+private fun isPlainNumber(s: String) =
+    s.length in 1..15 && s.all { it in '0'..'9' } && (s.length == 1 || s[0] != '0')
+
 fun buildXlsx(headers: List<String>, rows: List<List<String>>): ByteArray {
     val sheet = StringBuilder(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" +
-            "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData>"
+            "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">" +
+            "<cols><col min=\"1\" max=\"${headers.size}\" width=\"22\" customWidth=\"1\"/></cols><sheetData>"
     )
     (listOf(headers) + rows).forEachIndexed { r, row ->
         sheet.append("<row r=\"${r + 1}\">")
-        row.forEachIndexed { c, v ->
-            // inlineStr: barkodlar metin olarak kalır (baştaki sıfırlar silinmez)
-            if (v.isNotEmpty()) sheet.append(
-                "<c r=\"${colName(c)}${r + 1}\" t=\"inlineStr\"><is><t xml:space=\"preserve\">${esc(v)}</t></is></c>"
-            )
+        row.forEachIndexed { c, v0 ->
+            val v = v0.trim()
+            if (v.isEmpty()) return@forEachIndexed
+            val ref = "${colName(c)}${r + 1}"
+            if (r > 0 && isPlainNumber(v)) {
+                // s="1" -> #,##0 biçimi: binlik ayracı var, ondalık yok
+                sheet.append("<c r=\"$ref\" s=\"1\"><v>$v</v></c>")
+            } else {
+                sheet.append("<c r=\"$ref\" t=\"inlineStr\"><is><t xml:space=\"preserve\">${esc(v0)}</t></is></c>")
+            }
         }
         sheet.append("</row>")
     }
     sheet.append("</sheetData></worksheet>")
 
+    val styles = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">" +
+        "<fonts count=\"1\"><font><sz val=\"11\"/><name val=\"Calibri\"/></font></fonts>" +
+        "<fills count=\"2\"><fill><patternFill patternType=\"none\"/></fill><fill><patternFill patternType=\"gray125\"/></fill></fills>" +
+        "<borders count=\"1\"><border><left/><right/><top/><bottom/><diagonal/></border></borders>" +
+        "<cellStyleXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\"/></cellStyleXfs>" +
+        "<cellXfs count=\"2\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/>" +
+        "<xf numFmtId=\"3\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyNumberFormat=\"1\"/></cellXfs></styleSheet>"
+
     val files = linkedMapOf(
-        "[Content_Types].xml" to "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/><Default Extension=\"xml\" ContentType=\"application/xml\"/><Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/><Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/></Types>",
+        "[Content_Types].xml" to "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/><Default Extension=\"xml\" ContentType=\"application/xml\"/><Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/><Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/><Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/></Types>",
         "_rels/.rels" to "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/></Relationships>",
         "xl/workbook.xml" to "<?xml version=\"1.0\" encoding=\"UTF-8\"?><workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><sheets><sheet name=\"Sayfa1\" sheetId=\"1\" r:id=\"rId1\"/></sheets></workbook>",
-        "xl/_rels/workbook.xml.rels" to "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/></Relationships>",
+        "xl/_rels/workbook.xml.rels" to "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/><Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/></Relationships>",
+        "xl/styles.xml" to styles,
         "xl/worksheets/sheet1.xml" to sheet.toString()
     )
     val bos = ByteArrayOutputStream()
